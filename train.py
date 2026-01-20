@@ -77,7 +77,7 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 # stolen init / per-parameter LR
 stolen_ckpt_path = ""
-emb_lr_mult = 0.1   # embeddings LR = base_lr * emb_lr_mult
+emb_lr_mult = 1   # embeddings LR = base_lr * emb_lr_mult
 freeze_emb_iters = 0
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
