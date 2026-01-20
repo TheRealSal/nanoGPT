@@ -74,12 +74,15 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
+# stolen init / per-parameter LR
+stolen_ckpt_path = ""
+emb_lr_mult = 0.1   # embeddings LR = base_lr * emb_lr_mult
+freeze_emb_iters = 0
+# -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
-# stolen init / per-parameter LR
-stolen_ckpt_path = ""
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -207,6 +210,31 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
+
+# modify optimizer logic to potentially use smaller LRs for embedding params
+if stolen_ckpt_path != "":
+    # do optimizer param-group surgery
+
+    tied_param = model.lm_head.weight
+
+    # freeze during warmup
+    if freeze_emb_iters > 0:
+        tied_param.requires_grad = False
+
+    # remove from existing optimizer groups
+    for g in optimizer.param_groups:
+        while tied_param in g["params"]:
+            g["params"].remove(tied_param)
+
+    optimizer.param_groups = [g for g in optimizer.param_groups if len(g["params"]) > 0]
+
+    optimizer.add_param_group({
+        "params": [tied_param],
+        "weight_decay": 0.0,
+        "lr_mult": emb_lr_mult,
+        "lr": learning_rate * emb_lr_mult,
+    })
+
 checkpoint = None # free up memory
 
 # compile the model
@@ -265,7 +293,12 @@ while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        mult = param_group.get("lr_mult", 1.0)
+        param_group["lr"] = lr * mult
+
+    if freeze_emb_iters > 0 and iter_num == freeze_emb_iters:
+        raw_model.lm_head.weight.requires_grad = True
+        print(f"Unfroze tied embeddings/lm_head at iter {iter_num}")
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
